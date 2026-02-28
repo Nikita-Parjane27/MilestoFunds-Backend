@@ -7,8 +7,10 @@ const GEMINI_URL   = `https://generativelanguage.googleapis.com/v1beta/models/${
 
 const SYSTEM_INSTRUCTION = `You are an expert crowdfunding consultant and copywriter for Indian creators.
 Help creators craft compelling campaigns that attract backers and clearly communicate their vision.
-Always be specific, actionable, and encouraging. Keep responses concise and well-structured.
-When mentioning money, use Indian Rupees (₹).`;
+Always be specific, actionable, and encouraging.
+When mentioning money, use Indian Rupees (₹).
+IMPORTANT: Always give COMPLETE responses. Never stop in the middle. 
+Always finish every sentence, every list, every section fully before ending your response.`;
 
 // POST /api/ai/generate
 const generate = async (req, res) => {
@@ -27,8 +29,13 @@ const generate = async (req, res) => {
       );
     }
 
+    // 55 second timeout for Gemini (Render/Vercel max is 60s)
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 55000);
+
     const response = await fetch(`${GEMINI_URL}?key=${process.env.GEMINI_API_KEY}`, {
       method:  "POST",
+      signal:  controller.signal,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         system_instruction: {
@@ -38,32 +45,47 @@ const generate = async (req, res) => {
           { role: "user", parts: [{ text: prompt }] }
         ],
         generationConfig: {
-          maxOutputTokens: 1024,
+          maxOutputTokens: 8192,
           temperature:     0.7,
+          topP:            0.95,
+          topK:            40,
+          stopSequences:   [],
         },
       }),
-    });
+    }).finally(() => clearTimeout(timeout));
 
     if (!response.ok) {
       const err = await response.json().catch(() => ({}));
       console.error("[AI] Gemini API error:", JSON.stringify(err));
       const msg = err?.error?.message || "AI service returned an error.";
-
-      // Give user-friendly messages for common Gemini errors
-      if (msg.includes("API_KEY_INVALID") || msg.includes("API key not valid")) {
-        return sendError(res, "Invalid GEMINI_API_KEY. Check your .env file and get a key from https://aistudio.google.com/app/apikey", 401);
-      }
-      if (msg.includes("QUOTA") || msg.includes("quota")) {
-        return sendError(res, "Gemini API quota exceeded. Try again in a minute or upgrade your plan.", 429);
-      }
+      if (msg.includes("API_KEY_INVALID") || msg.includes("API key not valid"))
+        return sendError(res, "Invalid GEMINI_API_KEY. Get a key from https://aistudio.google.com/app/apikey", 401);
+      if (msg.includes("QUOTA") || msg.includes("quota"))
+        return sendError(res, "Gemini API quota exceeded. Try again in a minute.", 429);
       return sendError(res, `AI Error: ${msg}`, 502);
     }
 
     const data = await response.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    if (!text) return sendError(res, "AI returned an empty response. Please try again.", 502);
 
-    return res.json({ success: true, result: text });
+    // Log finish reason to debug incomplete responses
+    const finishReason = data.candidates?.[0]?.finishReason;
+    console.log(`[AI] tool:${tool} finishReason:${finishReason} tokens:${data.usageMetadata?.candidatesTokenCount}`);
+
+    // Collect ALL parts (Gemini sometimes splits into multiple parts)
+    const parts = data.candidates?.[0]?.content?.parts || [];
+    const text  = parts.map(p => p.text || "").join("").trim();
+
+    if (!text) {
+      console.error("[AI] Empty response. Full data:", JSON.stringify(data));
+      return sendError(res, "AI returned an empty response. Please try again.", 502);
+    }
+
+    // If stopped due to MAX_TOKENS, append a note
+    const result = finishReason === "MAX_TOKENS"
+      ? text + "\n\n*(Response was long — showing first part. Try a more specific input for a shorter result.)*"
+      : text;
+
+    return res.json({ success: true, result });
 
   } catch (err) {
     console.error("[AI] Unexpected error:", err.message);
@@ -142,7 +164,9 @@ Provide:
 Be honest but constructive. Format with clear headers for each risk.`,
   };
 
-  return prompts[tool] || null;
+  const p = prompts[tool] || null;
+  if (!p) return null;
+  return p + '\n\nIMPORTANT: Give a complete, full response. Do not stop midway.'; 
 }
 
 module.exports = { generate };
